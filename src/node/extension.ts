@@ -4,7 +4,7 @@
 
 'use strict';
 
-import * as http from 'http';
+import * as net from 'net';
 import * as vscode from 'vscode';
 import { spawn, spawnSync, exec } from 'child_process';
 import { basename, join, isAbsolute, dirname } from 'path';
@@ -278,9 +278,6 @@ function guessProgramFromPackage(folderPath: string): string | undefined {
 // For launch, use inspector protocol starting with v6.9 because it's stable after that version.
 const InspectorMinNodeVersionLaunch = 60900;
 
-// For attach, only require v6.3 because that's the minimum version where the inspector protocol is supported at all.
-const InspectorMinNodeVersionAttach = 60300;
-
 
 /**
  * The result type of the startSession command.
@@ -397,29 +394,49 @@ function getProtocolForAttach(config: any): Promise<string|undefined> {
 	const address = config.address || '127.0.0.1';
 	const port = config.port || 9229;
 
-	return getURL(`http://${address}:${port}/json/version`).then(response => {
-		try {
-			const versionObject = JSON.parse(response);
-			if (versionObject.length > 0) {
-				const semVerString: string = versionObject[0].Browser;
-				if (semVerString) {
-					if (semVerStringToInt(semVerString) >= InspectorMinNodeVersionAttach) {
-						log(localize('protocol.switch.inspector.version', "Debugging with inspector protocol because Node {0} was detected.", semVerString.trim()));
-						return 'inspector';
-					} else {
-						log(localize('protocol.switch.legacy.version', "Debugging with legacy protocol because Node {0} was detected.", semVerString.trim()));
-						return undefined;
-					}
-				}
+	const unknownProtocolMessage = localize('protocol.switch.unknown.version', "Debugging with legacy protocol because Node version could not be determined.");
+	const defaultResult = { reason: unknownProtocolMessage, protocol: 'legacy' };
+
+	const socket = new net.Socket();
+	const cleanup = () => {
+		socket.write(`"Content-Length: 50\r\n\r\n{"command":"disconnect","type":"request","seq":2}"`);
+		socket.end();
+	};
+
+	return new Promise<{reason: string, protocol: string}>(resolve => {
+		socket.once('data', data => {
+			let reason: string;
+			let protocol: string;
+			const dataStr = data.toString();
+			if (dataStr.indexOf('WebSockets request was expected') >= 0) {
+				reason = localize('protocol.switch.inspector.version', "Debugging with inspector protocol because it was detected");
+				protocol = 'inspector';
+			} else {
+				reason = localize('protocol.switch.legacy.version', "Debugging with legacy protocol because it was detected");
+				protocol = 'legacy';
 			}
-		} catch (e) {
-			// Not JSON
-		}
-		log(localize('protocol.switch.unknown.version', "Debugging with legacy protocol because Node version could not be determined."));
-	},
-	e => {
-		// Not inspector
-		log(localize('protocol.switch.unknown.version', "Debugging with legacy protocol because Node version could not be determined."));
+
+			resolve({ reason, protocol });
+		});
+
+		socket.once('error', err => {
+			resolve(defaultResult);
+		});
+
+		socket.connect(port, address);
+		socket.write(`Content-Length: 102\r\n\r\n{"command":"evaluate","arguments":{"expression":"process.pid","global":true},"type":"request","seq":1}`);
+
+		setTimeout(() => {
+			// No data or error received? Bail and let the debug adapter handle it.
+			resolve(defaultResult);
+		}, 1000);
+	}).catch(err => {
+		return defaultResult;
+	}).then(result => {
+		cleanup();
+		log(result.reason);
+
+		return result.protocol;
 	});
 }
 
@@ -432,26 +449,4 @@ function semVerStringToInt(vString: string): number {
 		return (parseInt(match[1])*100 + parseInt(match[2]))*100 + parseInt(match[3]);
 	}
 	return -1;
-}
-
-/**
- * Helper function to GET the contents of a url
- */
-function getURL(url: string): Promise<string> {
-	return new Promise((resolve, reject) => {
-		http.get(url, response => {
-			let responseData = '';
-			response.on('data', chunk => responseData += chunk);
-			response.on('end', () => {
-				// Sometimes the 'error' event is not fired. Double check here.
-				if (response.statusCode === 200) {
-					resolve(responseData);
-				} else {
-					reject(responseData);
-				}
-			});
-		}).on('error', e => {
-			reject(e);
-		});
-	});
 }
